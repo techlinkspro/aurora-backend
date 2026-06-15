@@ -5,6 +5,7 @@ const youtubedl = require('youtube-dl-exec');
 
 const app = express();
 
+// Enable CORS for all requests
 app.use(cors());
 
 // =========================================================
@@ -16,7 +17,8 @@ app.get('/extract', async (req, res) => {
 
     try {
         console.log("Extracting URL via yt-dlp:", targetUrl);
-        // yt-dlp execute kar rahe hain raw url nikalne ke liye
+        
+        // yt-dlp engine ko run kar rahe hain metadata nikalne ke liye
         const output = await youtubedl(targetUrl, {
             dumpSingleJson: true,
             noCheckCertificates: true,
@@ -24,7 +26,7 @@ app.get('/extract', async (req, res) => {
             preferFreeFormats: true
         });
 
-        // yt-dlp formats mein se best direct url dhoondhna
+        // yt-dlp formats mein se best direct raw video url dhoondhna
         const directUrl = output.url || 
                          (output.entries && output.entries[0]?.url) || 
                          (output.requested_formats && output.requested_formats[0]?.url);
@@ -41,7 +43,7 @@ app.get('/extract', async (req, res) => {
 });
 
 // =========================================================
-// 2. PROXY STREAMING API: IP block bypass karne ke liye
+// 2. PROXY STREAMING API: IP block aur CORS bypass karne ke liye
 // =========================================================
 app.get('/play', async (req, res) => {
     const videoUrl = req.query.url;
@@ -53,18 +55,19 @@ app.get('/play', async (req, res) => {
             url: videoUrl,
             responseType: 'stream',
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
                 'Referer': 'https://www.pornhub.com/' 
             }
         };
         
+        // Video seek/forward support karne ke liye range header pass karo
         if (req.headers.range) {
             options.headers.Range = req.headers.range;
         }
 
         const response = await axios(options);
 
-        // Security headers hatana taaki browser block na kare
+        // Target site ke strict security headers delete karo taaki browser block na kare
         Object.keys(response.headers).forEach(key => {
             const lowerKey = key.toLowerCase();
             if (!lowerKey.startsWith('access-control-') && lowerKey !== 'transfer-encoding') {
@@ -72,9 +75,11 @@ app.get('/play', async (req, res) => {
             }
         });
 
+        // Apna khud ka open CORS header lagao
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.status(response.status);
 
+        // Video data ko seedha pipe kar do user ke browser player mein
         response.data.pipe(res);
 
     } catch (error) {
