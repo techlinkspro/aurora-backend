@@ -1,38 +1,104 @@
 const express = require('express');
-const cors = require('cors');
 const axios = require('axios');
 const youtubedl = require('youtube-dl-exec');
+const { URL } = require('url');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Har jagah se request allow karne ke liye (CORS bypass)
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Range', 'Authorization']
-}));
+// ─────────────────────────────────────────────────
+// 1. SPOOF BROWSER HEADERS
+// ─────────────────────────────────────────────────
+const BROWSER_HEADERS = {
+  'User-Agent': [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+  ],
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'identity',  // No compression -> easy pipe
+  'Cache-Control': 'no-cache',
+  'DNT': '1',
+};
 
-// =========================================================
-// 1. ADVANCED EXTRACTOR: yt-dlp with Spoofing Headers
-// =========================================================
+function getRandomUserAgent() {
+  const list = BROWSER_HEADERS['User-Agent'];
+  return list[Math.floor(Math.random() * list.length)];
+}
+
+// ─────────────────────────────────────────────────
+// 2. OPEN CORS HANDLING
+// ─────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Range, Content-Type, Content-Length, Accept-Encoding');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ─────────────────────────────────────────────────
+// 3. HEADER SANITIZER (Removes strict security headers)
+// ─────────────────────────────────────────────────
+const STRIP_HEADERS = new Set([
+  'access-control-allow-origin',
+  'access-control-allow-methods',
+  'x-frame-options',
+  'content-security-policy',
+  'strict-transport-security',
+  'set-cookie'
+]);
+
+function setSafeHeaders(upstreamHeaders, res) {
+  Object.entries(upstreamHeaders).forEach(([key, value]) => {
+    if (!STRIP_HEADERS.has(key.toLowerCase())) {
+      res.set(key, value);
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────
+// 4. HLS MANIFEST REWRITER (.m3u8 Bypass)
+// ─────────────────────────────────────────────────
+function resolveAbsoluteUrl(uri, baseUrl) {
+  if (uri.startsWith('http://') || uri.startsWith('https://')) return uri;
+  return new URL(uri, baseUrl).href;
+}
+
+function rewriteManifest(body, finalTargetUrl, proxyBasePath) {
+  const lines = body.split('\n');
+  const rewritten = lines.map(line => {
+    const trimmed = line.trim();
+    if (trimmed && !trimmed.startsWith('#')) {
+      const absolute = resolveAbsoluteUrl(trimmed, finalTargetUrl);
+      return proxyBasePath + encodeURIComponent(absolute);
+    }
+    if (trimmed.startsWith('#EXT-X-KEY') || trimmed.startsWith('#EXT-X-MAP')) {
+      return trimmed.replace(/URI="([^"]*)"/g, (_, uri) => {
+        const abs = resolveAbsoluteUrl(uri, finalTargetUrl);
+        return `URI="${proxyBasePath}${encodeURIComponent(abs)}"`;
+      });
+    }
+    return trimmed;
+  });
+  return rewritten.join('\n');
+}
+
+// ─────────────────────────────────────────────────
+// 5. EXTRACTOR ROUTE (Gets raw video link using yt-dlp)
+// ─────────────────────────────────────────────────
 app.get('/extract', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).json({ error: "URL is required" });
 
     try {
-        console.log("Extracting URL via Ninja Proxy:", targetUrl);
-        
-        // yt-dlp ko browser ki tarah bhejna (Anti-bot bypass tricks)
+        console.log("Extracting URL via yt-dlp:", targetUrl);
         const output = await youtubedl(targetUrl, {
             dumpSingleJson: true,
             noCheckCertificates: true,
             noWarnings: true,
             preferFreeFormats: true,
-            addHeader: [
-                'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language: en-US,en;q=0.5'
-            ]
+            addHeader: [`User-Agent:${getRandomUserAgent()}`]
         });
 
         const directUrl = output.url || 
@@ -40,75 +106,78 @@ app.get('/extract', async (req, res) => {
                          (output.requested_formats && output.requested_formats[0]?.url);
 
         if (directUrl) {
-            res.json({ success: true, rawVideoUrl: directUrl, isHls: directUrl.includes('.m3u8') });
+            res.json({ success: true, rawVideoUrl: directUrl });
         } else {
             res.status(404).json({ error: "Video link not found by yt-dlp" });
         }
     } catch (error) {
         console.error("Extractor error:", error.message);
-        res.status(500).json({ error: "Failed to bypass security using yt-dlp" });
+        res.status(500).json({ error: "Failed to extract from target URL" });
     }
 });
 
-// =========================================================
-// 2. ULTIMATE STREAMING PROXY: IP & Header Spoofing
-// =========================================================
+// ─────────────────────────────────────────────────
+// 6. MAIN PROXY ENDPOINT (Streams the raw link)
+// ─────────────────────────────────────────────────
 app.get('/play', async (req, res) => {
-    const videoUrl = req.query.url;
-    if (!videoUrl) return res.status(400).send("No video URL provided");
+  const targetUrl = req.query.url;
+  if (!targetUrl) return res.status(400).json({ error: 'Missing ?url=' });
 
-    try {
-        // Ninja Headers - Asli insaan ban kar server ke paas jana
-        const headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Connection': 'keep-alive'
-        };
+  let parsed;
+  try { parsed = new URL(targetUrl); } 
+  catch { return res.status(400).json({ error: 'Invalid URL' }); }
 
-        // Agar user player mein video aage badhata hai (Seeking), toh Range pass karna zaroori hai
-        if (req.headers.range) {
-            headers['Range'] = req.headers.range;
-        }
+  const headers = {
+    ...BROWSER_HEADERS,
+    'User-Agent': getRandomUserAgent(),
+    'Referer': `${parsed.protocol}//${parsed.hostname}/`,
+    'Origin': `${parsed.protocol}//${parsed.hostname}`,
+  };
 
-        const options = {
-            method: 'GET',
-            url: videoUrl,
-            responseType: 'stream',
-            headers: headers,
-            maxRedirects: 5,
-            validateStatus: status => status >= 200 && status < 400 // Handle redirects properly
-        };
+  if (req.headers.range) headers['Range'] = req.headers.range;
 
-        const response = await axios(options);
+  try {
+    const response = await axios({
+      method: 'GET',
+      url: targetUrl,
+      headers,
+      responseType: 'stream',
+      maxRedirects: 5,
+      validateStatus: status => status < 500,
+    });
 
-        // Security headers ko filter karna (Target site ki deewar todna)
-        Object.keys(response.headers).forEach(key => {
-            const lowerKey = key.toLowerCase();
-            const badHeaders = ['access-control', 'x-frame-options', 'content-security-policy', 'strict-transport-security'];
-            
-            // In strict headers ko chhod kar baaki sab bhej do
-            if (!badHeaders.some(bad => lowerKey.startsWith(bad)) && lowerKey !== 'transfer-encoding') {
-                res.setHeader(key, response.headers[key]);
-            }
-        });
+    const finalUrl = response.request?.res?.responseUrl || targetUrl;
+    const contentType = (response.headers['content-type'] || '').toLowerCase();
+    const isHls = contentType.includes('mpegurl') || targetUrl.includes('.m3u8');
 
-        // Apna open CORS lagana taaki browser block na kare
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    // M3U8 Rewrite Logic
+    if (isHls) {
+      let body = '';
+      response.data.on('data', chunk => (body += chunk.toString()));
+      response.data.on('end', () => {
+        const rewritten = rewriteManifest(body, finalUrl, '/play?url=');
+        setSafeHeaders(response.headers, res);
         res.status(response.status);
-
-        // Stream ko pipe kar dena browser mein
-        response.data.pipe(res);
-
-    } catch (error) {
-        console.error("Stream Proxy Error:", error.message);
-        if (!res.headersSent) {
-            res.status(500).send("Error proxying video stream");
-        }
+        res.set('Content-Type', 'application/vnd.apple.mpegurl');
+        res.send(rewritten);
+      });
+      return;
     }
+
+    // Direct MP4 Pipe
+    setSafeHeaders(response.headers, res);
+    res.status(response.status);
+    response.data.pipe(res);
+
+  } catch (error) {
+    console.error('Proxy request failed:', error.message);
+    if (!res.headersSent) res.status(502).json({ error: 'Upstream stream error' });
+  }
 });
 
-const PORT = process.env.PORT || 3000;
+// ─────────────────────────────────────────────────
+// 7. START SERVER
+// ─────────────────────────────────────────────────
 app.listen(PORT, () => {
-    console.log(`Aurora Advanced Ninja Proxy running on port ${PORT}`);
+  console.log(`Aurora Advanced Proxy running on port ${PORT}`);
 });
