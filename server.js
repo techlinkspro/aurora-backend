@@ -174,6 +174,28 @@ app.get('/play', async (req, res) => {
     if (!res.headersSent) res.status(502).json({ error: 'Upstream stream error' });
   }
 });
+// ─────────────────────────────────────────────────
+// NEW: SHORTLINK DATABASE ROUTE (5-Character IDs)
+// ─────────────────────────────────────────────────
+// Ye aapka chhota sa in-memory database hai.
+// Yahan aap apne 5-character IDs ke aage unka asli link dalenge.
+const shortlinkDB = {
+    "1xkLw": "https://www.w3schools.com/html/mov_bbb.mp4",
+    "abcde": "https://sample-videos.com/video123.mp4"
+};
+
+app.get('/api/video/:id', (req, res) => {
+    const videoId = req.params.id;
+    const originalLink = shortlinkDB[videoId];
+
+    if (originalLink) {
+        // Agar link mil gaya, toh directly send kar do
+        // (Aap chahein toh isko apne /play proxy ke through bhi bhej sakte hain)
+        res.json({ success: true, url: originalLink });
+    } else {
+        res.status(404).json({ success: false, error: "Video not found in database!" });
+    }
+});
 
 // ─────────────────────────────────────────────────
 // 7. START SERVER
