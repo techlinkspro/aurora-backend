@@ -89,7 +89,7 @@ function rewriteManifest(body, finalTargetUrl, proxyBasePath) {
 // ─────────────────────────────────────────────────
 app.get('/api/video/:id', async (req, res) => {
     const videoId = req.params.id;
-    const shortUrl = `https://shortlink.uk/${videoId}`;
+    const shortUrl = `https://tinyurl.com/${videoId}`;
 
     try {
         console.log(`[1] Expanding shortlink: ${shortUrl}`);
