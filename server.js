@@ -85,7 +85,7 @@ function rewriteManifest(body, finalTargetUrl, proxyBasePath) {
 }
 
 // ─────────────────────────────────────────────────
-// 5. SUPER SMART SHORTLINK EXPANDER + EXTRACTOR
+// 5. SUPER SMART SHORTLINK EXPANDER + MULTI-QUALITY EXTRACTOR
 // ─────────────────────────────────────────────────
 app.get('/api/video/:id', async (req, res) => {
     const videoId = req.params.id;
@@ -118,30 +118,43 @@ app.get('/api/video/:id', async (req, res) => {
         // Step 2: Check agar already direct video hai (.mp4, .m3u8 aadi)
         if (contentType.includes('video/') || contentType.includes('mpegurl') || originalLink.match(/\.(mp4|m3u8|webm|mkv)$/i)) {
             console.log(`[3] Direct video found! Bypassing extractor.`);
+            // Direct video ke liye 'url' bhejege
             return res.json({ success: true, url: originalLink });
         }
 
-        // Step 3: Agar Webpage hai, toh usme se video churao (Extract karo)
-        console.log(`[3] Webpage detected. Extracting raw video using yt-dlp...`);
+        // Step 3: Agar Webpage hai, toh yt-dlp se saari qualities nikalo
+        console.log(`[3] Webpage detected. Extracting multi-quality raw video using yt-dlp...`);
         try {
             const output = await youtubedl(originalLink, {
                 dumpSingleJson: true,
                 noCheckCertificates: true,
-                noWarnings: true,
-                preferFreeFormats: true,
-                addHeader: [`User-Agent:${getRandomUserAgent()}`]
+                noWarnings: true
             });
 
-            // Find best direct url
-            const rawVideoUrl = output.url || 
-                               (output.entries && output.entries[0]?.url) || 
-                               (output.requested_formats && output.requested_formats[0]?.url);
+            let qualityMap = {};
+            
+            // Format check karte hain (yt-dlp saari qualities ki list deta hai)
+            if (output.formats && output.formats.length > 0) {
+                output.formats.forEach(f => {
+                    // Jin formats me resolution height (jaise 480, 720) aur video codec ho
+                    if (f.height && (f.ext === 'mp4' || f.vcodec !== 'none') && f.url) {
+                        qualityMap[`${f.height}p`] = f.url; // Jaise: "720p": "https://..."
+                    }
+                });
+            }
 
-            if (rawVideoUrl) {
-                console.log(`[4] Extraction Success! Sending raw video link to player.`);
-                return res.json({ success: true, url: rawVideoUrl });
+            // Agar formats nahi mile (kuch ajeeb websites), toh purana wala best quality default try karo
+            if (Object.keys(qualityMap).length === 0) {
+                const rawUrl = output.url || (output.entries && output.entries[0]?.url);
+                if (rawUrl) qualityMap['Auto'] = rawUrl;
+            }
+
+            if (Object.keys(qualityMap).length > 0) {
+                console.log(`[4] Multiple Qualities Extracted!`, Object.keys(qualityMap));
+                // Yahan dhyan do: hum 'urls' (plural) bhej rahe hain dictionary format mein
+                return res.json({ success: true, urls: qualityMap }); 
             } else {
-                return res.status(404).json({ success: false, error: "Webpage se koi video nahi mili." });
+                return res.status(404).json({ success: false, error: "Webpage se video nahi mili." });
             }
         } catch (dlError) {
             console.error("Extractor error:", dlError.message);
@@ -155,7 +168,7 @@ app.get('/api/video/:id', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────
-// 6. MAIN PROXY ENDPOINT (Streams the raw link)
+// 6. MAIN PROXY ENDPOINT (Streams the raw link bypassing CORS)
 // ─────────────────────────────────────────────────
 app.get('/play', async (req, res) => {
   const targetUrl = req.query.url;
