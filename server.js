@@ -85,7 +85,46 @@ function rewriteManifest(body, finalTargetUrl, proxyBasePath) {
 }
 
 // ─────────────────────────────────────────────────
-// 5. EXTRACTOR ROUTE (Gets raw video link using yt-dlp)
+// 5. AUTOMATIC SHORTLINK EXPANDER ROUTE (NO DATABASE NEEDED)
+// ─────────────────────────────────────────────────
+app.get('/api/video/:id', async (req, res) => {
+    const videoId = req.params.id;
+    
+    // Shortlink website ka URL ban raha hai id ke sath
+    const shortUrl = `https://shortlink.uk/${videoId}`;
+
+    try {
+        console.log(`Expanding shortlink automatically: ${shortUrl}`);
+
+        // Axios background mein link par jayega aur redirects follow karega
+        const response = await axios({
+            method: 'GET',
+            url: shortUrl,
+            headers: {
+                'User-Agent': getRandomUserAgent(),
+                'Accept': BROWSER_HEADERS['Accept']
+            },
+            maxRedirects: 5,
+            validateStatus: status => status < 500
+        });
+
+        // Redirect hone ke baad jo final link mila wo nikalenge
+        const originalLink = response.request?.res?.responseUrl || response.config?.url;
+
+        if (originalLink && originalLink !== shortUrl) {
+            console.log(`Success! Real Link Found: ${originalLink}`);
+            res.json({ success: true, url: originalLink });
+        } else {
+            res.status(404).json({ success: false, error: "Asli video link nahi nikal paaya ya redirect fail hua!" });
+        }
+    } catch (error) {
+        console.error("Shortlink expansion failed:", error.message);
+        res.status(500).json({ success: false, error: "Server link ko expand nahi kar paya." });
+    }
+});
+
+// ─────────────────────────────────────────────────
+// 6. EXTRACTOR ROUTE (Gets raw video link using yt-dlp)
 // ─────────────────────────────────────────────────
 app.get('/extract', async (req, res) => {
     const targetUrl = req.query.url;
@@ -117,7 +156,7 @@ app.get('/extract', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────
-// 6. MAIN PROXY ENDPOINT (Streams the raw link)
+// 7. MAIN PROXY ENDPOINT (Streams the raw link)
 // ─────────────────────────────────────────────────
 app.get('/play', async (req, res) => {
   const targetUrl = req.query.url;
@@ -128,8 +167,12 @@ app.get('/play', async (req, res) => {
   catch { return res.status(400).json({ error: 'Invalid URL' }); }
 
   const headers = {
-    ...BROWSER_HEADERS,
     'User-Agent': getRandomUserAgent(),
+    'Accept': BROWSER_HEADERS['Accept'],
+    'Accept-Language': BROWSER_HEADERS['Accept-Language'],
+    'Accept-Encoding': BROWSER_HEADERS['Accept-Encoding'],
+    'Cache-Control': BROWSER_HEADERS['Cache-Control'],
+    'DNT': BROWSER_HEADERS['DNT'],
     'Referer': `${parsed.protocol}//${parsed.hostname}/`,
     'Origin': `${parsed.protocol}//${parsed.hostname}`,
   };
@@ -174,31 +217,9 @@ app.get('/play', async (req, res) => {
     if (!res.headersSent) res.status(502).json({ error: 'Upstream stream error' });
   }
 });
-// ─────────────────────────────────────────────────
-// NEW: SHORTLINK DATABASE ROUTE (5-Character IDs)
-// ─────────────────────────────────────────────────
-// Ye aapka chhota sa in-memory database hai.
-// Yahan aap apne 5-character IDs ke aage unka asli link dalenge.
-const shortlinkDB = {
-    "1xkLw": "https://www.w3schools.com/html/mov_bbb.mp4",
-    "abcde": "https://sample-videos.com/video123.mp4"
-};
-
-app.get('/api/video/:id', (req, res) => {
-    const videoId = req.params.id;
-    const originalLink = shortlinkDB[videoId];
-
-    if (originalLink) {
-        // Agar link mil gaya, toh directly send kar do
-        // (Aap chahein toh isko apne /play proxy ke through bhi bhej sakte hain)
-        res.json({ success: true, url: originalLink });
-    } else {
-        res.status(404).json({ success: false, error: "Video not found in database!" });
-    }
-});
 
 // ─────────────────────────────────────────────────
-// 7. START SERVER
+// 8. START SERVER
 // ─────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Aurora Advanced Proxy running on port ${PORT}`);
