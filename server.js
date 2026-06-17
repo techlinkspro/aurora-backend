@@ -16,7 +16,7 @@ const BROWSER_HEADERS = {
   ],
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
   'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'identity',  // No compression -> easy pipe
+  'Accept-Encoding': 'identity',
   'Cache-Control': 'no-cache',
   'DNT': '1',
 };
@@ -38,7 +38,7 @@ app.use((req, res, next) => {
 });
 
 // ─────────────────────────────────────────────────
-// 3. HEADER SANITIZER (Removes strict security headers)
+// 3. HEADER SANITIZER
 // ─────────────────────────────────────────────────
 const STRIP_HEADERS = new Set([
   'access-control-allow-origin',
@@ -85,18 +85,16 @@ function rewriteManifest(body, finalTargetUrl, proxyBasePath) {
 }
 
 // ─────────────────────────────────────────────────
-// 5. AUTOMATIC SHORTLINK EXPANDER ROUTE (NO DATABASE NEEDED)
+// 5. SUPER SMART SHORTLINK EXPANDER + EXTRACTOR
 // ─────────────────────────────────────────────────
 app.get('/api/video/:id', async (req, res) => {
     const videoId = req.params.id;
-    
-    // Shortlink website ka URL ban raha hai id ke sath
     const shortUrl = `https://shortlink.uk/${videoId}`;
 
     try {
-        console.log(`Expanding shortlink automatically: ${shortUrl}`);
+        console.log(`[1] Expanding shortlink: ${shortUrl}`);
 
-        // Axios background mein link par jayega aur redirects follow karega
+        // Step 1: Link ko expand karna
         const response = await axios({
             method: 'GET',
             url: shortUrl,
@@ -108,55 +106,56 @@ app.get('/api/video/:id', async (req, res) => {
             validateStatus: status => status < 500
         });
 
-        // Redirect hone ke baad jo final link mila wo nikalenge
         const originalLink = response.request?.res?.responseUrl || response.config?.url;
+        const contentType = (response.headers['content-type'] || '').toLowerCase();
 
-        if (originalLink && originalLink !== shortUrl) {
-            console.log(`Success! Real Link Found: ${originalLink}`);
-            res.json({ success: true, url: originalLink });
-        } else {
-            res.status(404).json({ success: false, error: "Asli video link nahi nikal paaya ya redirect fail hua!" });
+        if (!originalLink) {
+            return res.status(404).json({ success: false, error: "Link expand nahi hua!" });
         }
+
+        console.log(`[2] Resolved Link: ${originalLink} | Type: ${contentType}`);
+
+        // Step 2: Check agar already direct video hai (.mp4, .m3u8 aadi)
+        if (contentType.includes('video/') || contentType.includes('mpegurl') || originalLink.match(/\.(mp4|m3u8|webm|mkv)$/i)) {
+            console.log(`[3] Direct video found! Bypassing extractor.`);
+            return res.json({ success: true, url: originalLink });
+        }
+
+        // Step 3: Agar Webpage hai, toh usme se video churao (Extract karo)
+        console.log(`[3] Webpage detected. Extracting raw video using yt-dlp...`);
+        try {
+            const output = await youtubedl(originalLink, {
+                dumpSingleJson: true,
+                noCheckCertificates: true,
+                noWarnings: true,
+                preferFreeFormats: true,
+                addHeader: [`User-Agent:${getRandomUserAgent()}`]
+            });
+
+            // Find best direct url
+            const rawVideoUrl = output.url || 
+                               (output.entries && output.entries[0]?.url) || 
+                               (output.requested_formats && output.requested_formats[0]?.url);
+
+            if (rawVideoUrl) {
+                console.log(`[4] Extraction Success! Sending raw video link to player.`);
+                return res.json({ success: true, url: rawVideoUrl });
+            } else {
+                return res.status(404).json({ success: false, error: "Webpage se koi video nahi mili." });
+            }
+        } catch (dlError) {
+            console.error("Extractor error:", dlError.message);
+            return res.status(500).json({ success: false, error: "Webpage extraction fail ho gayi." });
+        }
+
     } catch (error) {
-        console.error("Shortlink expansion failed:", error.message);
-        res.status(500).json({ success: false, error: "Server link ko expand nahi kar paya." });
+        console.error("Process failed:", error.message);
+        res.status(500).json({ success: false, error: "Server process fail ho gaya." });
     }
 });
 
 // ─────────────────────────────────────────────────
-// 6. EXTRACTOR ROUTE (Gets raw video link using yt-dlp)
-// ─────────────────────────────────────────────────
-app.get('/extract', async (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).json({ error: "URL is required" });
-
-    try {
-        console.log("Extracting URL via yt-dlp:", targetUrl);
-        const output = await youtubedl(targetUrl, {
-            dumpSingleJson: true,
-            noCheckCertificates: true,
-            noWarnings: true,
-            preferFreeFormats: true,
-            addHeader: [`User-Agent:${getRandomUserAgent()}`]
-        });
-
-        const directUrl = output.url || 
-                         (output.entries && output.entries[0]?.url) || 
-                         (output.requested_formats && output.requested_formats[0]?.url);
-
-        if (directUrl) {
-            res.json({ success: true, rawVideoUrl: directUrl });
-        } else {
-            res.status(404).json({ error: "Video link not found by yt-dlp" });
-        }
-    } catch (error) {
-        console.error("Extractor error:", error.message);
-        res.status(500).json({ error: "Failed to extract from target URL" });
-    }
-});
-
-// ─────────────────────────────────────────────────
-// 7. MAIN PROXY ENDPOINT (Streams the raw link)
+// 6. MAIN PROXY ENDPOINT (Streams the raw link)
 // ─────────────────────────────────────────────────
 app.get('/play', async (req, res) => {
   const targetUrl = req.query.url;
@@ -193,7 +192,6 @@ app.get('/play', async (req, res) => {
     const contentType = (response.headers['content-type'] || '').toLowerCase();
     const isHls = contentType.includes('mpegurl') || targetUrl.includes('.m3u8');
 
-    // M3U8 Rewrite Logic
     if (isHls) {
       let body = '';
       response.data.on('data', chunk => (body += chunk.toString()));
@@ -207,7 +205,6 @@ app.get('/play', async (req, res) => {
       return;
     }
 
-    // Direct MP4 Pipe
     setSafeHeaders(response.headers, res);
     res.status(response.status);
     response.data.pipe(res);
@@ -219,7 +216,7 @@ app.get('/play', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────
-// 8. START SERVER
+// 7. START SERVER
 // ─────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`Aurora Advanced Proxy running on port ${PORT}`);
