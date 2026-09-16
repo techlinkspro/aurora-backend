@@ -1,236 +1,133 @@
 const express = require('express');
+const cors = require('cors');
 const axios = require('axios');
-const youtubedl = require('youtube-dl-exec');
-const { URL } = require('url');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─────────────────────────────────────────────────
-// 1. SPOOF BROWSER HEADERS
-// ─────────────────────────────────────────────────
-const BROWSER_HEADERS = {
-  'User-Agent': [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-  ],
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'identity',
-  'Cache-Control': 'no-cache',
-  'DNT': '1',
-};
+// Middleware
+app.use(cors());
+app.use(express.json());
 
-function getRandomUserAgent() {
-  const list = BROWSER_HEADERS['User-Agent'];
-  return list[Math.floor(Math.random() * list.length)];
-}
+// ==========================================
+// 1. TERABOX LINK FETCHER (XAPIverse)
+// ==========================================
+const XAPIVERSE_KEY = "xapi_ce405c2e899429fc98a56690fc80061a";
 
-// ─────────────────────────────────────────────────
-// 2. OPEN CORS HANDLING
-// ─────────────────────────────────────────────────
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Range, Content-Type, Content-Length, Accept-Encoding');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
+app.get('/api/fetch', async (req, res) => {
+    let { url } = req.query;
+    if (!url) return res.status(400).json({ success: false, error: "URL is required" });
 
-// ─────────────────────────────────────────────────
-// 3. HEADER SANITIZER
-// ─────────────────────────────────────────────────
-const STRIP_HEADERS = new Set([
-  'access-control-allow-origin',
-  'access-control-allow-methods',
-  'x-frame-options',
-  'content-security-policy',
-  'strict-transport-security',
-  'set-cookie'
-]);
-
-function setSafeHeaders(upstreamHeaders, res) {
-  Object.entries(upstreamHeaders).forEach(([key, value]) => {
-    if (!STRIP_HEADERS.has(key.toLowerCase())) {
-      res.set(key, value);
-    }
-  });
-}
-
-// ─────────────────────────────────────────────────
-// 4. HLS MANIFEST REWRITER (.m3u8 Bypass)
-// ─────────────────────────────────────────────────
-function resolveAbsoluteUrl(uri, baseUrl) {
-  if (uri.startsWith('http://') || uri.startsWith('https://')) return uri;
-  return new URL(uri, baseUrl).href;
-}
-
-function rewriteManifest(body, finalTargetUrl, proxyBasePath) {
-  const lines = body.split('\n');
-  const rewritten = lines.map(line => {
-    const trimmed = line.trim();
-    if (trimmed && !trimmed.startsWith('#')) {
-      const absolute = resolveAbsoluteUrl(trimmed, finalTargetUrl);
-      return proxyBasePath + encodeURIComponent(absolute);
-    }
-    if (trimmed.startsWith('#EXT-X-KEY') || trimmed.startsWith('#EXT-X-MAP')) {
-      return trimmed.replace(/URI="([^"]*)"/g, (_, uri) => {
-        const abs = resolveAbsoluteUrl(uri, finalTargetUrl);
-        return `URI="${proxyBasePath}${encodeURIComponent(abs)}"`;
-      });
-    }
-    return trimmed;
-  });
-  return rewritten.join('\n');
-}
-
-// ─────────────────────────────────────────────────
-// 5. SUPER SMART SHORTLINK EXPANDER + MULTI-QUALITY EXTRACTOR
-// ─────────────────────────────────────────────────
-app.get('/api/video/:id', async (req, res) => {
-    const videoId = req.params.id;
-    const shortUrl = `https://tinyurl.com/${videoId}`;
+    // Format URL correctly
+    url = url.replace('1024terabox.com', 'teraboxapp.com');
 
     try {
-        console.log(`[1] Expanding shortlink: ${shortUrl}`);
+        console.log(`\n[FETCH] Requesting Direct Link for: ${url}`);
+        
+        const response = await axios.post("https://xapiverse.com/api/terabox", 
+            { url: url }, 
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'xAPIverse-Key': XAPIVERSE_KEY
+                }
+            }
+        );
 
-        // Step 1: Link ko expand karna
-        const response = await axios({
-            method: 'GET',
-            url: shortUrl,
-            headers: {
-                'User-Agent': getRandomUserAgent(),
-                'Accept': BROWSER_HEADERS['Accept']
-            },
-            maxRedirects: 5,
-            validateStatus: status => status < 500
-        });
+        const data = response.data;
+        let directUrl = null;
+        let thumb = null;
 
-        const originalLink = response.request?.res?.responseUrl || response.config?.url;
-        const contentType = (response.headers['content-type'] || '').toLowerCase();
-
-        if (!originalLink) {
-            return res.status(404).json({ success: false, error: "Link expand nahi hua!" });
+        // XAPIverse format se direct link extract karna
+        if (data && data.status === "success" && data.list && data.list.length > 0) {
+            const fileData = data.list[0];
+            directUrl = fileData.normal_dlink || fileData.hd_dlink || fileData.fast_dlink;
+            thumb = fileData.thumb || data.thumb || "";
         }
 
-        console.log(`[2] Resolved Link: ${originalLink} | Type: ${contentType}`);
+        if (directUrl) {
+            console.log("[FETCH] Success! Direct link generated.");
+            res.json({ success: true, url: directUrl, thumb: thumb });
+        } else {
+            console.log("[FETCH] Failed: API response format missing links.");
+            res.status(404).json({ success: false, error: "Video direct link not found." });
+        }
+    } catch (error) {
+        console.error("[FETCH ERROR]", error.message);
+        res.status(500).json({ success: false, error: "Failed to connect to Terabox extractor API." });
+    }
+});
 
-        // Step 2: Check agar already direct video hai (.mp4, .m3u8 aadi)
-        if (contentType.includes('video/') || contentType.includes('mpegurl') || originalLink.match(/\.(mp4|m3u8|webm|mkv)$/i)) {
-            console.log(`[3] Direct video found! Bypassing extractor.`);
-            // Direct video ke liye 'url' bhejege
-            return res.json({ success: true, url: originalLink });
+// ==========================================
+// 2. VIDEO STREAM PROXY (Bypass IP/CORS)
+// ==========================================
+app.get('/stream', async (req, res) => {
+    const { videoUrl } = req.query;
+    if (!videoUrl) return res.status(400).send("No video URL provided");
+
+    try {
+        // Terabox Bypass Headers
+        const headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Referer': 'https://www.terabox.com/',
+            'Cookie': 'ndus=Yu20_XVpeHui6RHQNyZc9CiWB0d01tczCEujUdkX;' // Aapki Cookie
+        };
+
+        // Handle Video Seeking (Range Requests)
+        if (req.headers.range) {
+            headers['Range'] = req.headers.range;
         }
 
-        // Step 3: Agar Webpage hai, toh yt-dlp se saari qualities nikalo
-        console.log(`[3] Webpage detected. Extracting multi-quality raw video using yt-dlp...`);
-        try {
-            const output = await youtubedl(originalLink, {
-                dumpSingleJson: true,
-                noCheckCertificates: true,
-                noWarnings: true
+        let currentUrl = videoUrl;
+        let response;
+        
+        // Follow redirects manually to avoid streaming issues
+        for (let i = 0; i < 5; i++) { 
+            response = await axios({
+                method: 'GET',
+                url: currentUrl,
+                responseType: 'stream',
+                headers: headers,
+                maxRedirects: 0,
+                validateStatus: (status) => status >= 200 && status < 400
             });
 
-            let qualityMap = {};
-            
-            // Format check karte hain (yt-dlp saari qualities ki list deta hai)
-            if (output.formats && output.formats.length > 0) {
-                output.formats.forEach(f => {
-                    // Jin formats me resolution height (jaise 480, 720) aur video codec ho
-                    if (f.height && (f.ext === 'mp4' || f.vcodec !== 'none') && f.url) {
-                        qualityMap[`${f.height}p`] = f.url; // Jaise: "720p": "https://..."
-                    }
-                });
-            }
-
-            // Agar formats nahi mile (kuch ajeeb websites), toh purana wala best quality default try karo
-            if (Object.keys(qualityMap).length === 0) {
-                const rawUrl = output.url || (output.entries && output.entries[0]?.url);
-                if (rawUrl) qualityMap['Auto'] = rawUrl;
-            }
-
-            if (Object.keys(qualityMap).length > 0) {
-                console.log(`[4] Multiple Qualities Extracted!`, Object.keys(qualityMap));
-                // Yahan dhyan do: hum 'urls' (plural) bhej rahe hain dictionary format mein
-                return res.json({ success: true, urls: qualityMap }); 
+            if (response.status >= 300 && response.status < 400 && response.headers.location) {
+                currentUrl = response.headers.location;
             } else {
-                return res.status(404).json({ success: false, error: "Webpage se video nahi mili." });
+                break; 
             }
-        } catch (dlError) {
-            console.error("Extractor error:", dlError.message);
-            return res.status(500).json({ success: false, error: "Webpage extraction fail ho gayi." });
         }
 
-    } catch (error) {
-        console.error("Process failed:", error.message);
-        res.status(500).json({ success: false, error: "Server process fail ho gaya." });
-    }
-});
-
-// ─────────────────────────────────────────────────
-// 6. MAIN PROXY ENDPOINT (Streams the raw link bypassing CORS)
-// ─────────────────────────────────────────────────
-app.get('/play', async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).json({ error: 'Missing ?url=' });
-
-  let parsed;
-  try { parsed = new URL(targetUrl); } 
-  catch { return res.status(400).json({ error: 'Invalid URL' }); }
-
-  const headers = {
-    'User-Agent': getRandomUserAgent(),
-    'Accept': BROWSER_HEADERS['Accept'],
-    'Accept-Language': BROWSER_HEADERS['Accept-Language'],
-    'Accept-Encoding': BROWSER_HEADERS['Accept-Encoding'],
-    'Cache-Control': BROWSER_HEADERS['Cache-Control'],
-    'DNT': BROWSER_HEADERS['DNT'],
-    'Referer': `${parsed.protocol}//${parsed.hostname}/`,
-    'Origin': `${parsed.protocol}//${parsed.hostname}`,
-  };
-
-  if (req.headers.range) headers['Range'] = req.headers.range;
-
-  try {
-    const response = await axios({
-      method: 'GET',
-      url: targetUrl,
-      headers,
-      responseType: 'stream',
-      maxRedirects: 5,
-      validateStatus: status => status < 500,
-    });
-
-    const finalUrl = response.request?.res?.responseUrl || targetUrl;
-    const contentType = (response.headers['content-type'] || '').toLowerCase();
-    const isHls = contentType.includes('mpegurl') || targetUrl.includes('.m3u8');
-
-    if (isHls) {
-      let body = '';
-      response.data.on('data', chunk => (body += chunk.toString()));
-      response.data.on('end', () => {
-        const rewritten = rewriteManifest(body, finalUrl, '/play?url=');
-        setSafeHeaders(response.headers, res);
+        // Pass headers back to the browser for smooth playback
         res.status(response.status);
-        res.set('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(rewritten);
-      });
-      return;
+        ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(header => {
+            if (response.headers[header]) {
+                res.setHeader(header, response.headers[header]);
+            }
+        });
+
+        // Pipe the video stream
+        response.data.pipe(res);
+
+        // Clean up connection when user stops video
+        req.on('close', () => {
+            if (response.data && typeof response.data.destroy === 'function') {
+                response.data.destroy();
+            }
+        });
+
+    } catch (error) {
+        console.error("\n[STREAM ERROR] Failed to proxy video:", error.message);
+        res.status(500).send("Error streaming video from Terabox.");
     }
-
-    setSafeHeaders(response.headers, res);
-    res.status(response.status);
-    response.data.pipe(res);
-
-  } catch (error) {
-    console.error('Proxy request failed:', error.message);
-    if (!res.headersSent) res.status(502).json({ error: 'Upstream stream error' });
-  }
 });
 
-// ─────────────────────────────────────────────────
-// 7. START SERVER
-// ─────────────────────────────────────────────────
+// ==========================================
+// START SERVER
+// ==========================================
 app.listen(PORT, () => {
-  console.log(`Aurora Advanced Proxy running on port ${PORT}`);
+    console.log(`======================================`);
+    console.log(`🚀 Terabox Proxy Server is LIVE on port ${PORT}`);
+    console.log(`======================================`);
 });
